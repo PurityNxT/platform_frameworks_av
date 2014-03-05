@@ -121,11 +121,13 @@ static int load_audio_interface(const char *if_name, audio_hw_device_t **dev)
     if (rc) {
         goto out;
     }
+#if !defined(ICS_AUDIO_BLOB) && !defined(MR0_AUDIO_BLOB)
     if ((*dev)->common.version != AUDIO_DEVICE_API_VERSION_CURRENT) {
         ALOGE("%s wrong audio hw device version %04x", __func__, (*dev)->common.version);
         rc = BAD_VALUE;
         goto out;
     }
+#endif
     return 0;
 
 out:
@@ -237,6 +239,13 @@ AudioFlinger::AudioHwDevice* AudioFlinger::findSuitableHwDev_l(
             if ((dev->get_supported_devices != NULL) &&
                     (dev->get_supported_devices(dev) & devices) == devices)
                 return audioHwDevice;
+#ifdef ICS_AUDIO_BLOB
+            else if (dev->get_supported_devices == NULL && i != 0 &&
+                    devices == 0x80)
+                // Reasonably safe assumption: A non-primary HAL without
+                // get_supported_devices is a locally-built A2DP binary
+                return audioHwDevice;
+#endif
         }
     } else {
         // check a match for the requested module handle
@@ -735,6 +744,7 @@ status_t AudioFlinger::setMasterMute(bool muted)
     Mutex::Autolock _l(mLock);
     mMasterMute = muted;
 
+#ifndef ICS_AUDIO_BLOB
     // Set master mute in the HALs which support it.
     for (size_t i = 0; i < mAudioHwDevs.size(); i++) {
         AutoMutex lock(mHardwareLock);
@@ -753,6 +763,7 @@ status_t AudioFlinger::setMasterMute(bool muted)
     // mute will simply ignore the setting.
     for (size_t i = 0; i < mPlaybackThreads.size(); i++)
         mPlaybackThreads.valueAt(i)->setMasterMute(muted);
+#endif
 
     return NO_ERROR;
 }
@@ -1005,7 +1016,11 @@ size_t AudioFlinger::getInputBufferSize(uint32_t sampleRate, audio_format_t form
     config.format = format;
 
     audio_hw_device_t *dev = mPrimaryHardwareDev->hwDevice();
+#ifndef ICS_AUDIO_BLOB
     size_t size = dev->get_input_buffer_size(dev, &config);
+#else
+    size_t size = dev->get_input_buffer_size(dev, sampleRate, format, popcount(channelMask));
+#endif
     mHardwareStatus = AUDIO_HW_IDLE;
     return size;
 }
@@ -1020,6 +1035,20 @@ unsigned int AudioFlinger::getInputFramesLost(audio_io_handle_t ioHandle) const
     }
     return 0;
 }
+
+#ifdef STE_AUDIO
+size_t AudioFlinger::readInput(audio_io_handle_t input, audio_input_clients inputClientId,
+        void *buffer, uint32_t bytes, uint32_t *pOverwrittenBytes)
+{
+    if (input == 0 || buffer == NULL) {
+        return 0;
+    }
+
+    AudioStreamIn* InStream = (AudioStreamIn*)input;
+
+    return 0;
+}
+#endif
 
 status_t AudioFlinger::setVoiceVolume(float value)
 {
@@ -1291,7 +1320,7 @@ sp<IAudioRecord> AudioFlinger::openRecord(
                                                   frameCount, lSessionId,
                                                   IPCThreadState::self()->getCallingUid(),
                                                   flags, tid, &lStatus);
-        LOG_ALWAYS_FATAL_IF((lStatus == NO_ERROR) && (recordTrack == 0));
+        LOG_ALWAYS_FATAL_IF((recordTrack != 0) != (lStatus == NO_ERROR));
     }
     if (lStatus != NO_ERROR) {
         // remove local strong reference to Client before deleting the RecordTrack so that the
@@ -1360,6 +1389,7 @@ audio_module_handle_t AudioFlinger::loadHwModule_l(const char *name)
     {  // scope for auto-lock pattern
         AutoMutex lock(mHardwareLock);
 
+#if !defined(ICS_AUDIO_BLOB) && !defined(MR0_AUDIO_BLOB)
         if (0 == mAudioHwDevs.size()) {
             mHardwareStatus = AUDIO_HW_GET_MASTER_VOLUME;
             if (NULL != dev->get_master_volume) {
@@ -1377,6 +1407,7 @@ audio_module_handle_t AudioFlinger::loadHwModule_l(const char *name)
                 }
             }
         }
+#endif
 
         mHardwareStatus = AUDIO_HW_SET_MASTER_VOLUME;
         if ((NULL != dev->set_master_volume) &&
@@ -1385,12 +1416,14 @@ audio_module_handle_t AudioFlinger::loadHwModule_l(const char *name)
                     AudioHwDevice::AHWD_CAN_SET_MASTER_VOLUME);
         }
 
+#if !defined(ICS_AUDIO_BLOB) && !defined(MR0_AUDIO_BLOB)
         mHardwareStatus = AUDIO_HW_SET_MASTER_MUTE;
         if ((NULL != dev->set_master_mute) &&
             (OK == dev->set_master_mute(dev, mMasterMute))) {
             flags = static_cast<AudioHwDevice::Flags>(flags |
                     AudioHwDevice::AHWD_CAN_SET_MASTER_MUTE);
         }
+#endif
 
         mHardwareStatus = AUDIO_HW_IDLE;
     }
@@ -1486,12 +1519,24 @@ audio_io_handle_t AudioFlinger::openOutput(audio_module_handle_t module,
 
     mHardwareStatus = AUDIO_HW_OUTPUT_OPEN;
 
-    status_t status = hwDevHal->open_output_stream(hwDevHal,
+    status_t status;
+#ifndef ICS_AUDIO_BLOB
+    status = hwDevHal->open_output_stream(hwDevHal,
                                           id,
                                           *pDevices,
                                           (audio_output_flags_t)flags,
                                           &config,
                                           &outStream);
+#else
+    status = hwDevHal->open_output_stream(hwDevHal,
+                                          *pDevices,
+                                          (int *)&config.format,
+                                          &config.channel_mask,
+                                          &config.sample_rate,
+                                          &outStream);
+    uint32_t newflags = flags | AUDIO_OUTPUT_FLAG_PRIMARY;
+    flags = (audio_output_flags_t)newflags;
+#endif
 
     mHardwareStatus = AUDIO_HW_IDLE;
     ALOGV("openOutput() openOutputStream returned output %p, SamplingRate %d, Format %#08x, "
@@ -1536,7 +1581,11 @@ audio_io_handle_t AudioFlinger::openOutput(audio_module_handle_t module,
         thread->audioConfigChanged_l(AudioSystem::OUTPUT_OPENED);
 
         // the first primary output opened designates the primary hw device
+#ifdef STE_AUDIO
+        if ( mPrimaryHardwareDev == NULL ) {
+#else
         if ((mPrimaryHardwareDev == NULL) && (flags & AUDIO_OUTPUT_FLAG_PRIMARY)) {
+#endif
             ALOGI("Using module %d has the primary audio interface", module);
             mPrimaryHardwareDev = outHwDev;
 
@@ -1666,11 +1715,50 @@ status_t AudioFlinger::restoreOutput(audio_io_handle_t output)
     return NO_ERROR;
 }
 
+#ifdef STE_AUDIO
+uint32_t *AudioFlinger::addInputClient(uint32_t clientId)
+{
+    Mutex::Autolock _l(mLock);
+
+    uint32_t *pNewClient = new uint32_t;
+    if (pNewClient) {
+        *pNewClient = clientId;
+        mInputClients.add(pNewClient);
+    }
+
+    return pNewClient;
+}
+
+status_t AudioFlinger::removeInputClient(uint32_t *pClientId)
+{
+    status_t result = NO_ERROR;
+
+    Mutex::Autolock _l(mLock);
+
+    if (pClientId == NULL) {
+        result = BAD_VALUE;
+    } else if (mInputClients.remove(pClientId) < 0) {
+        result = BAD_VALUE;
+    } else {
+        // the pointer was found in the vector and is non-NULL, so it must point to memory	8071
+        // allocated by addInputClient => free it.
+        delete pClientId;
+    }
+
+    return result;
+}
+#endif
+
 audio_io_handle_t AudioFlinger::openInput(audio_module_handle_t module,
                                           audio_devices_t *pDevices,
                                           uint32_t *pSamplingRate,
                                           audio_format_t *pFormat,
+#ifdef STE_AUDIO
+                                          audio_channel_mask_t *pChannelMask,
+                                          audio_input_clients *pInputClientId)
+#else
                                           audio_channel_mask_t *pChannelMask)
+#endif
 {
     status_t status;
     RecordThread *thread = NULL;
@@ -1684,6 +1772,10 @@ audio_io_handle_t AudioFlinger::openInput(audio_module_handle_t module,
     audio_channel_mask_t reqChannels = config.channel_mask;
     audio_stream_in_t *inStream = NULL;
     AudioHwDevice *inHwDev;
+#ifdef STE_AUDIO
+    bool returnRecordThread = true;
+    audio_input_clients inputClientId;
+#endif
 
     if (pDevices == NULL || *pDevices == 0) {
         return 0;
@@ -1695,29 +1787,67 @@ audio_io_handle_t AudioFlinger::openInput(audio_module_handle_t module,
     if (inHwDev == NULL)
         return 0;
 
+#ifdef STE_AUDIO
+    if (pInputClientId != NULL && *pInputClientId == AUDIO_INPUT_CLIENT_PLAYBACK) {
+        returnRecordThread = false;
+    }
+#endif
+
     audio_hw_device_t *inHwHal = inHwDev->hwDevice();
     audio_io_handle_t id = nextUniqueId();
 
+#ifndef ICS_AUDIO_BLOB
     status = inHwHal->open_input_stream(inHwHal, id, *pDevices, &config,
                                         &inStream);
+#else
+    status = inHwHal->open_input_stream(inHwHal, *pDevices, 
+                                        (int *)&config.format, 
+                                        &config.channel_mask,
+                                        &config.sample_rate, (audio_in_acoustics_t)0,
+                                        &inStream);
+#endif
     ALOGV("openInput() openInputStream returned input %p, SamplingRate %d, Format %d, Channels %x, "
+#ifdef STE_AUDIO
+            "status %d, pInputClientId %p",
+#else
             "status %d",
+#endif
             inStream,
             config.sample_rate,
             config.format,
             config.channel_mask,
+#ifdef STE_AUDIO
+            status,
+            pInputClientId);
+#else
             status);
+#endif
 
     // If the input could not be opened with the requested parameters and we can handle the
     // conversion internally, try to open again with the proposed parameters. The AudioFlinger can
     // resample the input and do mono to stereo or stereo to mono conversions on 16 bit PCM inputs.
+#ifdef STE_AUDIO
+    if (inStream == NULL && status == ALREADY_EXISTS) {
+        ALOGD("Input already exists");
+        return 0;
+    } else if (inStream == NULL && status == BAD_VALUE &&
+#else
     if (status == BAD_VALUE &&
+#endif
         reqFormat == config.format && config.format == AUDIO_FORMAT_PCM_16_BIT &&
         (config.sample_rate <= 2 * reqSamplingRate) &&
         (popcount(config.channel_mask) <= FCC_2) && (popcount(reqChannels) <= FCC_2)) {
         ALOGV("openInput() reopening with proposed sampling rate and channel mask");
         inStream = NULL;
+#ifndef ICS_AUDIO_BLOB
         status = inHwHal->open_input_stream(inHwHal, id, *pDevices, &config, &inStream);
+#else
+        status = inHwHal->open_input_stream(inHwHal, *pDevices, 
+                                        (int *)&config.format, 
+                                        &config.channel_mask,
+                                        &config.sample_rate, (audio_in_acoustics_t)0,
+                                        &inStream);
+#endif
     }
 
     if (status == NO_ERROR && inStream != NULL) {
@@ -1782,7 +1912,12 @@ audio_io_handle_t AudioFlinger::openInput(audio_module_handle_t module,
                                   reqChannels,
                                   id,
                                   primaryOutputDevice_l(),
+#ifdef STE_AUDIO
+                                  *pDevices,
+                                  inputClientId
+#else
                                   *pDevices
+#endif
 #ifdef TEE_SINK
                                   , teeSink
 #endif
@@ -1799,6 +1934,12 @@ audio_io_handle_t AudioFlinger::openInput(audio_module_handle_t module,
             *pChannelMask = reqChannels;
         }
 
+#ifdef STE_AUDIO
+        if (pInputClientId != NULL) {
+            *pInputClientId = inputClientId;
+        }
+#endif
+
         // notify client processes of the new input creation
         thread->audioConfigChanged_l(AudioSystem::INPUT_OPENED);
         return id;
@@ -1807,10 +1948,45 @@ audio_io_handle_t AudioFlinger::openInput(audio_module_handle_t module,
     return 0;
 }
 
+#ifdef STE_AUDIO
+status_t AudioFlinger::closeInput(audio_io_handle_t input, audio_input_clients *inputClientId)
+{
+    // keep strong reference on the record thread so that
+    // it is not destroyed while exit() is executed
+    Mutex::Autolock _l(mLock);
+    AudioStreamIn* stream = (AudioStreamIn*)input;
+    audio_input_clients clientId = (audio_input_clients) *inputClientId;
+    sp <RecordThread> thread;
+    thread = checkRecordThread_l(input);
+    if (thread != NULL) {
+        stream = thread->getInput();
+    }
+    if (inputClientId == NULL) {
+        if (thread == NULL) {
+            return BAD_VALUE;
+        }
+        ALOGV("closeInput() %d", input);
+        void *param2 = 0;
+        audioConfigChanged_l(AudioSystem::INPUT_CLOSED, input, param2);
+        mRecordThreads.removeItem(input);
+    }
+
+    AudioStreamIn *in = (AudioStreamIn *)stream;
+    in->hwDev()->close_input_stream(in->hwDev(), in->stream);
+    delete in;
+
+    if (thread != NULL) {
+        thread->exit();
+    }
+
+    return NO_ERROR;
+}
+#else
 status_t AudioFlinger::closeInput(audio_io_handle_t input)
 {
     return closeInput_nonvirtual(input);
 }
+#endif
 
 status_t AudioFlinger::closeInput_nonvirtual(audio_io_handle_t input)
 {
