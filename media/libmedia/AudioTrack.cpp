@@ -156,6 +156,9 @@ AudioTrack::~AudioTrack()
         IPCThreadState::self()->flushCommands();
         AudioSystem::releaseAudioSessionId(mSessionId);
     }
+#ifdef STE_AUDIO
+        AudioSystem::unregisterLatencyNotificationClient(mLatencyClientId);
+#endif
 }
 
 status_t AudioTrack::set(
@@ -866,8 +869,7 @@ status_t AudioTrack::createTrack_l(
     ALOGV("createTrack_l() output %d afLatency %d", output, afLatency);
 
     // The client's AudioTrack buffer is divided into n parts for purpose of wakeup by server, where
-    //  n = 1   fast track with single buffering; nBuffering is ignored
-    //  n = 2   fast track with double buffering
+    //  n = 1   fast track; nBuffering is ignored
     //  n = 2   normal track, no sample rate conversion
     //  n = 3   normal track, with sample rate conversion
     //          (pessimistic; some non-1:1 conversion ratios don't actually need triple-buffering)
@@ -1007,11 +1009,9 @@ status_t AudioTrack::createTrack_l(
             ALOGV("AUDIO_OUTPUT_FLAG_FAST successful; frameCount %u", frameCount);
             mAwaitBoost = true;
             if (sharedBuffer == 0) {
-                // Theoretically double-buffering is not required for fast tracks,
-                // due to tighter scheduling.  But in practice, to accommodate kernels with
-                // scheduling jitter, and apps with computation jitter, we use double-buffering.
-                if (mNotificationFramesAct == 0 || mNotificationFramesAct > frameCount/nBuffering) {
-                    mNotificationFramesAct = frameCount/nBuffering;
+                // double-buffering is not required for fast tracks, due to tighter scheduling
+                if (mNotificationFramesAct == 0 || mNotificationFramesAct > frameCount) {
+                    mNotificationFramesAct = frameCount;
                 }
             }
         } else {
@@ -1092,6 +1092,11 @@ status_t AudioTrack::obtainBuffer(Buffer* audioBuffer, int32_t waitCount)
         audioBuffer->raw = NULL;
         return INVALID_OPERATION;
     }
+#ifdef STE_AUDIO
+    if (mLatencyClientId != -1) {
+        AudioSystem::unregisterLatencyNotificationClient(mLatencyClientId);
+    }
+#endif
 
     const struct timespec *requested;
     if (waitCount == -1) {
@@ -1785,6 +1790,15 @@ uint32_t AudioTrack::getUnderrunFrames() const
     AutoMutex lock(mLock);
     return mProxy->getUnderrunFrames();
 }
+
+#ifdef STE_AUDIO
+// static
+void AudioTrack::LatencyCallback(void *cookie, audio_io_handle_t output, uint32_t sinkLatency)
+{
+    AudioTrack *me = static_cast<AudioTrack *>(cookie);
+    me->mLatency = sinkLatency + (1000*me->mCblk->frameCount) / me->mCblk->sampleRate;
+}
+#endif
 
 // =========================================================================
 
