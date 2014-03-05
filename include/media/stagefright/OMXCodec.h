@@ -86,6 +86,10 @@ struct OMXCodec : public MediaSource,
     // from MediaBufferObserver
     virtual void signalBufferReturned(MediaBuffer *buffer);
 
+#ifdef STE_HARDWARE
+    static uint32_t OmxToHALFormat(OMX_COLOR_FORMATTYPE omxValue);
+#endif
+
     enum Quirks {
         kNeedsFlushBeforeDisable              = 1,
         kWantsNALFragments                    = 2,
@@ -100,6 +104,16 @@ struct OMXCodec : public MediaSource,
         kSupportsMultipleFramesPerInputBuffer = 1024,
         kRequiresLargerEncoderOutputBuffer    = 2048,
         kOutputBuffersAreUnreadable           = 4096,
+#if defined(OMAP_ENHANCEMENT)
+        kAvoidMemcopyInputRecordingFrames     = 0x20000000,
+#endif
+#ifdef QCOM_HARDWARE
+        kRequiresGlobalFlush                  = 0x20000000, // 2^29
+        kRequiresWMAProComponent              = 0x40000000, //2^30
+#endif
+#ifdef STE_HARDWARE
+        kRequiresStoreMetaDataBeforeIdle      = 16384,
+#endif
     };
 
     struct CodecNameAndQuirks {
@@ -139,10 +153,18 @@ private:
         EXECUTING_TO_IDLE,
         IDLE_TO_LOADED,
         RECONFIGURING,
+#ifdef QCOM_HARDWARE
+        PAUSING,
+        FLUSHING,
+        PAUSED,
+#endif
         ERROR
     };
 
     enum {
+#ifdef QCOM_HARDWARE
+        kPortIndexBoth   = -1,
+#endif
         kPortIndexInput  = 0,
         kPortIndexOutput = 1
     };
@@ -169,6 +191,7 @@ private:
         size_t mSize;
         void *mData;
         MediaBuffer *mMediaBuffer;
+        bool mOutputCropChanged;
     };
 
     struct CodecSpecificData {
@@ -255,7 +278,7 @@ private:
             OMX_VIDEO_CODINGTYPE compressionFormat,
             OMX_COLOR_FORMATTYPE colorFormat);
 
-    void setVideoInputFormat(
+    status_t setVideoInputFormat(
             const char *mime, const sp<MetaData>& meta);
 
     status_t setupBitRate(int32_t bitRate);
@@ -291,6 +314,9 @@ private:
 
     status_t allocateBuffers();
     status_t allocateBuffersOnPort(OMX_U32 portIndex);
+#ifdef USE_SAMSUNG_COLORFORMAT
+    void setNativeWindowColorFormat(OMX_COLOR_FORMATTYPE &eNativeColorFormat);
+#endif
     status_t allocateOutputBuffersFromNativeWindow();
 
     status_t queueBufferToNativeWindow(BufferInfo *info);
@@ -316,92 +342,4 @@ private:
     BufferInfo *findEmptyInputBuffer();
 
     // Returns true iff a flush was initiated and a completion event is
-    // upcoming, false otherwise (A flush was not necessary as we own all
-    // the buffers on that port).
-    // This method will ONLY ever return false for a component with quirk
-    // "kRequiresFlushCompleteEmulation".
-    bool flushPortAsync(OMX_U32 portIndex);
-
-    void disablePortAsync(OMX_U32 portIndex);
-    status_t enablePortAsync(OMX_U32 portIndex);
-
-    static size_t countBuffersWeOwn(const Vector<BufferInfo> &buffers);
-    static bool isIntermediateState(State state);
-
-    void onEvent(OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2);
-    void onCmdComplete(OMX_COMMANDTYPE cmd, OMX_U32 data);
-    void onStateChange(OMX_STATETYPE newState);
-    void onPortSettingsChanged(OMX_U32 portIndex);
-
-    void setState(State newState);
-
-    status_t init();
-    void initOutputFormat(const sp<MetaData> &inputFormat);
-    status_t initNativeWindow();
-
-    void initNativeWindowCrop();
-
-    void dumpPortStatus(OMX_U32 portIndex);
-
-    status_t configureCodec(const sp<MetaData> &meta);
-
-    status_t applyRotation();
-    status_t waitForBufferFilled_l();
-
-    int64_t getDecodingTimeUs();
-
-    status_t parseAVCCodecSpecificData(
-            const void *data, size_t size,
-            unsigned *profile, unsigned *level);
-
-    status_t stopOmxComponent_l();
-
-    OMXCodec(const OMXCodec &);
-    OMXCodec &operator=(const OMXCodec &);
-};
-
-struct CodecCapabilities {
-    enum {
-        kFlagSupportsAdaptivePlayback = 1 << 0,
-    };
-
-    String8 mComponentName;
-    Vector<CodecProfileLevel> mProfileLevels;
-    Vector<OMX_U32> mColorFormats;
-    uint32_t mFlags;
-};
-
-// Return a vector of componentNames with supported profile/level pairs
-// supporting the given mime type, if queryDecoders==true, returns components
-// that decode content of the given type, otherwise returns components
-// that encode content of the given type.
-// profile and level indications only make sense for h.263, mpeg4 and avc
-// video.
-// If hwCodecOnly==true, only returns hardware-based components, software and
-// hardware otherwise.
-// The profile/level values correspond to
-// OMX_VIDEO_H263PROFILETYPE, OMX_VIDEO_MPEG4PROFILETYPE,
-// OMX_VIDEO_AVCPROFILETYPE, OMX_VIDEO_H263LEVELTYPE, OMX_VIDEO_MPEG4LEVELTYPE
-// and OMX_VIDEO_AVCLEVELTYPE respectively.
-
-status_t QueryCodecs(
-        const sp<IOMX> &omx,
-        const char *mimeType, bool queryDecoders, bool hwCodecOnly,
-        Vector<CodecCapabilities> *results);
-
-status_t QueryCodecs(
-        const sp<IOMX> &omx,
-        const char *mimeType, bool queryDecoders,
-        Vector<CodecCapabilities> *results);
-
-status_t QueryCodec(
-        const sp<IOMX> &omx,
-        const char *componentName, const char *mime,
-        bool isEncoder,
-        CodecCapabilities *caps);
-
-status_t getOMXChannelMapping(size_t numChannels, OMX_AUDIO_CHANNELTYPE map[]);
-
-}  // namespace android
-
-#endif  // OMX_CODEC_H_
+    // upcoming, false otherwise (A flush was not necessary as we own 
