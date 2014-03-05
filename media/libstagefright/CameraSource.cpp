@@ -96,11 +96,20 @@ static int32_t getColorFormat(const char* colorFormat) {
     }
 
     if (!strcmp(colorFormat, CameraParameters::PIXEL_FORMAT_YUV420SP)) {
+#ifdef USE_SAMSUNG_COLORFORMAT
+        static const int OMX_SEC_COLOR_FormatNV12LPhysicalAddress = 0x7F000002;
+        return OMX_SEC_COLOR_FormatNV12LPhysicalAddress;
+#else
         return OMX_COLOR_FormatYUV420SemiPlanar;
+#endif
     }
 
     if (!strcmp(colorFormat, CameraParameters::PIXEL_FORMAT_YUV422I)) {
+#if defined(TARGET_OMAP3) && defined(OMAP_ENHANCEMENT)
+        return OMX_COLOR_FormatCbYCrY;
+#else
         return OMX_COLOR_FormatYCbYCr;
+#endif
     }
 
     if (!strcmp(colorFormat, CameraParameters::PIXEL_FORMAT_RGB565)) {
@@ -110,10 +119,16 @@ static int32_t getColorFormat(const char* colorFormat) {
     if (!strcmp(colorFormat, "OMX_TI_COLOR_FormatYUV420PackedSemiPlanar")) {
        return OMX_TI_COLOR_FormatYUV420PackedSemiPlanar;
     }
-
+/*
     if (!strcmp(colorFormat, CameraParameters::PIXEL_FORMAT_ANDROID_OPAQUE)) {
         return OMX_COLOR_FormatAndroidOpaque;
     }
+*/
+#ifdef STE_HARDWARE
+    if (!strcmp(colorFormat, CameraParameters::PIXEL_FORMAT_YUV420MB)) {
+       return OMX_STE_COLOR_FormatYUV420PackedSemiPlanarMB;
+    }
+#endif
 
     ALOGE("Uknown color format (%s), please add it to "
          "CameraSource::getColorFormat", colorFormat);
@@ -340,11 +355,13 @@ status_t CameraSource::configureCamera(
         ALOGV("Supported frame rates: %s", supportedFrameRates);
         char buf[4];
         snprintf(buf, 4, "%d", frameRate);
+#ifndef HTC_3D_SUPPORT  // HTC uses invalid frame rates intentionally on the 3D camera
         if (strstr(supportedFrameRates, buf) == NULL) {
             ALOGE("Requested frame rate (%d) is not supported: %s",
                 frameRate, supportedFrameRates);
             return BAD_VALUE;
         }
+#endif
 
         // The frame rate is supported, set the camera to the requested value.
         params->setPreviewFrameRate(frameRate);
@@ -442,11 +459,13 @@ status_t CameraSource::checkFrameRate(
 
     // Check the actual video frame rate against the target/requested
     // video frame rate.
+#ifndef HTC_3D_SUPPORT  // HTC uses invalid frame rates intentionally on the 3D camera
     if (frameRate != -1 && (frameRateActual - frameRate) != 0) {
         ALOGE("Failed to set preview frame rate to %d fps. The actual "
                 "frame rate is %d", frameRate, frameRateActual);
         return UNKNOWN_ERROR;
     }
+#endif
 
     // Good now.
     mVideoFrameRate = frameRateActual;
@@ -555,13 +574,22 @@ status_t CameraSource::initWithCameraAccess(
 
     // XXX: query camera for the stride and slice height
     // when the capability becomes available.
+#ifdef STE_HARDWARE
+    int stride = newCameraParams.getInt(CameraParameters::KEY_RECORD_STRIDE);
+    int sliceHeight = newCameraParams.getInt(CameraParameters::KEY_RECORD_SLICE_HEIGHT);
+#endif
     mMeta = new MetaData;
     mMeta->setCString(kKeyMIMEType,  MEDIA_MIMETYPE_VIDEO_RAW);
     mMeta->setInt32(kKeyColorFormat, mColorFormat);
     mMeta->setInt32(kKeyWidth,       mVideoSize.width);
     mMeta->setInt32(kKeyHeight,      mVideoSize.height);
+#ifdef STE_HARDWARE
+    mMeta->setInt32(kKeyStride,      stride != -1 ? stride : mVideoSize.width);
+    mMeta->setInt32(kKeySliceHeight, sliceHeight != -1 ? sliceHeight : mVideoSize.height);
+#else
     mMeta->setInt32(kKeyStride,      mVideoSize.width);
     mMeta->setInt32(kKeySliceHeight, mVideoSize.height);
+#endif
     mMeta->setInt32(kKeyFrameRate,   mVideoFrameRate);
     return OK;
 }
@@ -813,6 +841,10 @@ status_t CameraSource::read(
 void CameraSource::dataCallbackTimestamp(int64_t timestampUs,
         int32_t msgType, const sp<IMemory> &data) {
     ALOGV("dataCallbackTimestamp: timestamp %lld us", timestampUs);
+    if (!mStarted) {
+       ALOGD("Stop recording issued. Return here.");
+       return;
+    }
     Mutex::Autolock autoLock(mLock);
     if (!mStarted || (mNumFramesReceived == 0 && timestampUs < mStartTimeUs)) {
         ALOGV("Drop frame at %lld/%lld us", timestampUs, mStartTimeUs);
