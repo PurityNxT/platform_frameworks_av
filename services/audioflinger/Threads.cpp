@@ -135,12 +135,12 @@ static const int kPriorityFastMixer = 3;
 
 // IAudioFlinger::createTrack() reports back to client the total size of shared memory area
 // for the track.  The client then sub-divides this into smaller buffers for its use.
-// Currently the client uses N-buffering by default, but doesn't tell us about the value of N.
-// So for now we just assume that client is double-buffered for fast tracks.
-// FIXME It would be better for client to tell AudioFlinger the value of N,
-// so AudioFlinger could allocate the right amount of memory.
+// Currently the client uses double-buffering by default, but doesn't tell us about that.
+// So for now we just assume that client is double-buffered.
+// FIXME It would be better for client to tell AudioFlinger whether it wants double-buffering or
+// N-buffering, so AudioFlinger could allocate the right amount of memory.
 // See the client's minBufCount and mNotificationFramesAct calculations for details.
-static const int kFastTrackMultiplier = 2;
+static const int kFastTrackMultiplier = 1;
 
 // ----------------------------------------------------------------------------
 
@@ -1210,7 +1210,7 @@ sp<AudioFlinger::PlaybackThread::Track> AudioFlinger::PlaybackThread::createTrac
               (
                 (tid != -1) &&
                 ((frameCount == 0) ||
-                (frameCount >= mFrameCount))
+                (frameCount >= (mFrameCount * kFastTrackMultiplier)))
               )
             ) &&
             // PCM data
@@ -1559,6 +1559,9 @@ void AudioFlinger::PlaybackThread::audioConfigChanged_l(int event, int param) {
         break;
 
     case AudioSystem::STREAM_CONFIG_CHANGED:
+#ifdef STE_AUDIO
+    case AudioSystem::SINK_LATENCY_CHANGED:
+#endif
         param2 = &param;
     case AudioSystem::OUTPUT_CLOSED:
     default:
@@ -2752,11 +2755,13 @@ void AudioFlinger::MixerThread::threadLoop_mix()
     int64_t pts;
     status_t status = INVALID_OPERATION;
 
+#ifndef ICS_AUDIO_BLOB
     if (mNormalSink != 0) {
         status = mNormalSink->getNextWriteTimestamp(&pts);
     } else {
         status = mOutputSink->getNextWriteTimestamp(&pts);
     }
+#endif
 
     if (status != NO_ERROR) {
         pts = AudioBufferProvider::kInvalidPTS;
@@ -3416,6 +3421,12 @@ bool AudioFlinger::MixerThread::checkForNewParameters_l()
             }
         }
 
+#ifdef STE_AUDIO
+        if (param.getInt(String8(AudioParameter::keySinkLatency), value) == NO_ERROR) {
+            sendIoConfigEvent_l(AudioSystem::SINK_LATENCY_CHANGED, value);
+        }
+#endif
+
         if (status == NO_ERROR) {
             status = mOutput->stream->common.set_parameters(&mOutput->stream->common,
                                                     keyValuePair.string());
@@ -3861,12 +3872,7 @@ bool AudioFlinger::AsyncCallbackThread::threadLoop()
 
         {
             Mutex::Autolock _l(mLock);
-            while (!((mWriteAckSequence & 1) ||
-                            (mDrainSequence & 1) ||
-                            exitPending())) {
-                mWaitWorkCV.wait(mLock);
-            }
-
+            mWaitWorkCV.wait(mLock);
             if (exitPending()) {
                 break;
             }
@@ -3941,7 +3947,8 @@ AudioFlinger::OffloadThread::OffloadThread(const sp<AudioFlinger>& audioFlinger,
     :   DirectOutputThread(audioFlinger, output, id, device, OFFLOAD),
         mHwPaused(false),
         mFlushPending(false),
-        mPausedBytesRemaining(0)
+        mPausedBytesRemaining(0),
+        mPreviousTrack(NULL)
 {
     //FIXME: mStandby should be set to true by ThreadBase constructor
     mStandby = true;
@@ -4194,9 +4201,6 @@ void AudioFlinger::OffloadThread::flushHw_l()
     mBytesRemaining = 0;
     mPausedWriteLength = 0;
     mPausedBytesRemaining = 0;
-    // Treat flush as moving OffloadThread state back to Idle.
-    mHwPaused = false;
-
     if (mUseAsyncWrite) {
         // discard any pending drain or write ack by incrementing sequence
         mWriteAckSequence = (mWriteAckSequence + 2) & ~1;
@@ -4380,7 +4384,12 @@ AudioFlinger::RecordThread::RecordThread(const sp<AudioFlinger>& audioFlinger,
                                          audio_channel_mask_t channelMask,
                                          audio_io_handle_t id,
                                          audio_devices_t outDevice,
+#ifdef STE_AUDIO
+                                         audio_devices_t inDevice,
+                                         audio_input_clients pInputClientId
+#else
                                          audio_devices_t inDevice
+#endif
 #ifdef TEE_SINK
                                          , const sp<NBAIO_Sink>& teeSink
 #endif
@@ -4397,7 +4406,9 @@ AudioFlinger::RecordThread::RecordThread(const sp<AudioFlinger>& audioFlinger,
 #endif
 {
     snprintf(mName, kNameLength, "AudioIn_%X", id);
-
+#ifdef STE_AUDIO
+    mInputClientId = pInputClientId;
+#endif
     readInputParameters();
 }
 
@@ -4695,7 +4706,7 @@ sp<AudioFlinger::RecordThread::RecordTrack>  AudioFlinger::RecordThread::createR
             (
                 (tid != -1) &&
                 ((frameCount == 0) ||
-                (frameCount >= mFrameCount))
+                (frameCount >= (mFrameCount * kFastTrackMultiplier)))
             ) &&
             // FIXME when record supports non-PCM data, also check for audio_is_linear_pcm(format)
             // mono or stereo
@@ -4750,7 +4761,7 @@ sp<AudioFlinger::RecordThread::RecordTrack>  AudioFlinger::RecordThread::createR
         if (track->getCblk() == 0) {
             ALOGE("createRecordTrack_l() no control block");
             lStatus = NO_MEMORY;
-            // track must be cleared from the caller as the caller has the AF lock
+            track.clear();
             goto Exit;
         }
         mTracks.add(track);
@@ -5295,6 +5306,14 @@ KeyedVector<int, bool> AudioFlinger::RecordThread::sessionIds() const
     }
     return ids;
 }
+
+#ifdef STE_AUDIO
+AudioFlinger::AudioStreamIn* AudioFlinger::RecordThread::getInput() const
+{
+    Mutex::Autolock _l(mLock);
+    return mInput;
+}
+#endif
 
 AudioFlinger::AudioStreamIn* AudioFlinger::RecordThread::clearInput()
 {
