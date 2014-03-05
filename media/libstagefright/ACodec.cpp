@@ -37,6 +37,10 @@
 
 #include <OMX_Component.h>
 
+#ifdef USE_SAMSUNG_COLORFORMAT
+#include <sec_format.h>
+#endif
+
 #include "include/avc_utils.h"
 
 namespace android {
@@ -572,11 +576,26 @@ status_t ACodec::configureOutputBuffersFromNativeWindow(
         return err;
     }
 
+#ifdef USE_SAMSUNG_COLORFORMAT
+    OMX_COLOR_FORMATTYPE eNativeColorFormat = def.format.video.eColorFormat;
+    setNativeWindowColorFormat(eNativeColorFormat);
+
+    err = native_window_set_buffers_geometry(
+    mNativeWindow.get(),
+    def.format.video.nFrameWidth,
+    def.format.video.nFrameHeight,
+    eNativeColorFormat);
+#else
     err = native_window_set_buffers_geometry(
             mNativeWindow.get(),
             def.format.video.nFrameWidth,
             def.format.video.nFrameHeight,
+#ifdef STE_HARDWARE
+            OMXCodec::OmxToHALFormat(def.format.video.eColorFormat));
+#else
             def.format.video.eColorFormat);
+#endif
+#endif
 
     if (err != 0) {
         ALOGE("native_window_set_buffers_geometry failed: %s (%d)",
@@ -789,6 +808,25 @@ status_t ACodec::submitOutputMetaDataBuffer() {
     info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
     return OK;
 }
+
+#ifdef USE_SAMSUNG_COLORFORMAT
+void ACodec::setNativeWindowColorFormat(OMX_COLOR_FORMATTYPE &eNativeColorFormat)
+{
+    // In case of Samsung decoders, we set proper native color format for the Native Window
+    if (!strcasecmp(mComponentName.c_str(), "OMX.SEC.AVC.Decoder")
+        || !strcasecmp(mComponentName.c_str(), "OMX.SEC.FP.AVC.Decoder")) {
+        switch (eNativeColorFormat) {
+            case OMX_COLOR_FormatYUV420SemiPlanar:
+                eNativeColorFormat = (OMX_COLOR_FORMATTYPE)HAL_PIXEL_FORMAT_YCbCr_420_SP;
+                break;
+            case OMX_COLOR_FormatYUV420Planar:
+            default:
+                eNativeColorFormat = (OMX_COLOR_FORMATTYPE)HAL_PIXEL_FORMAT_YCbCr_420_P;
+                break;
+        }
+    }
+}
+#endif
 
 status_t ACodec::cancelBufferToNativeWindow(BufferInfo *info) {
     CHECK_EQ((int)info->mStatus, (int)BufferInfo::OWNED_BY_US);
@@ -1690,6 +1728,20 @@ status_t ACodec::setSupportedOutputFormat() {
             &format, sizeof(format));
     CHECK_EQ(err, (status_t)OK);
     CHECK_EQ((int)format.eCompressionFormat, (int)OMX_VIDEO_CodingUnused);
+
+    CHECK(format.eColorFormat == OMX_COLOR_FormatYUV420Planar
+           || format.eColorFormat == OMX_COLOR_FormatYUV420SemiPlanar
+           || format.eColorFormat == OMX_COLOR_FormatCbYCrY
+           || format.eColorFormat == OMX_TI_COLOR_FormatYUV420PackedSemiPlanar
+           || format.eColorFormat == OMX_QCOM_COLOR_FormatYVU420SemiPlanar
+#ifdef QCOM_HARDWARE
+           || format.eColorFormat == OMX_QCOM_COLOR_FormatYVU420PackedSemiPlanar32m4ka
+           || format.eColorFormat == OMX_QCOM_COLOR_FormatYUV420PackedSemiPlanar64x32Tile2m8ka
+#endif
+#ifdef STE_HARDWARE
+           || format.eColorFormat == OMX_STE_COLOR_FormatYUV420PackedSemiPlanarMB
+#endif
+         );
 
     return mOMX->setParameter(
             mNode, OMX_IndexParamVideoPortFormat,
